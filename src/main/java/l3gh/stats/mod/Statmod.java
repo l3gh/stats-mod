@@ -17,20 +17,20 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 
 public class Statmod implements ModInitializer {
 	public static final String MOD_ID = "stat-mod";
-
-	// This logger is used to write text to the console and the log file.
-	// It is considered best practice to use your mod id as the logger's name.
-	// That way, it's clear which mod wrote info, warnings, and errors.
 	public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
 	public void onInitialize() {
 		ServerLifecycleEvents.SERVER_STARTED.register(server -> {
 
 			ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
-			LOGGER.info("L3gh Mod uhm idk just some log statement");
+			LOGGER.info("yes, the l3gh mod DID start atleast...");
 
 			Path configFile = FabricLoader.getInstance().getConfigDir().resolve("stat-mod.json");
 			String secret;
@@ -49,27 +49,46 @@ public class Statmod implements ModInitializer {
 			scheduler.scheduleAtFixedRate(
 					() -> {
 						Path statsDir = server.getWorldPath(LevelResource.PLAYER_STATS_DIR);
-						Path userCache = server.getWorldPath(LevelResource.ROOT).getParent().resolve("usercache.json");
+						Path userCache = server.getServerDirectory().toPath().resolve("usercache.json");
 						try {
 							String userCacheContent = Files.readString(userCache);
 
+							JsonObject payload = new JsonObject();
+							payload.addProperty("secret", secret);
+							payload.add("usercache", JsonParser.parseString(userCacheContent));
+
+							JsonObject stats = new JsonObject();
 							Files.list(statsDir).forEach(statFile -> {
 								try {
 									String statContent = Files.readString(statFile);
-									LOGGER.info("Read stats for: " + statFile.getFileName());
+									String uuid = statFile.getFileName().toString().replace(".json", "");
+									stats.add(uuid, JsonParser.parseString(statContent));
 								} catch (IOException e) {
 									LOGGER.error("Failed to read stat file: " + e.getMessage());
 								}
 							});
-						} catch (IOException e) {
+							payload.add("stats", stats);
+
+							LOGGER.info("Pushing stats... payload built for " + stats.size() + " players");
+
+							HttpClient client = HttpClient.newHttpClient();
+							HttpRequest request = HttpRequest.newBuilder()
+									.uri(URI.create(endpoint))
+									.header("Content-Type", "application/json")
+									.POST(HttpRequest.BodyPublishers.ofString(payload.toString()))
+									.build();
+
+							HttpResponse<String> response = client.send(request, HttpResponse.BodyHandlers.ofString());
+							LOGGER.info("Ingest response: " + response.statusCode());
+
+						} catch (IOException | InterruptedException e) {
 							LOGGER.error("Failed to read files: " + e.getMessage());
 						}
 						LOGGER.info("Pushing stats...");
-
-					},  // the task
-					0,              // initial delay
-					5,              // interval
-					TimeUnit.MINUTES // unit
+					},  // thats the whole mod ^^
+					0,              // initial delay - changing this is lowk pointless
+					3,              // interval in given unit
+					TimeUnit.MINUTES // unit - just dont touch me ig
 			);
 		});
 	}
