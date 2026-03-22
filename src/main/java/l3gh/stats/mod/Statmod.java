@@ -62,7 +62,12 @@ public class Statmod implements ModInitializer {
 								try {
 									String statContent = Files.readString(statFile);
 									String uuid = statFile.getFileName().toString().replace(".json", "");
-									stats.add(uuid, JsonParser.parseString(statContent));
+									long lastModified = Files.getLastModifiedTime(statFile).toMillis();
+
+									JsonObject playerData = new JsonObject();
+									playerData.add("stats", JsonParser.parseString(statContent));
+									playerData.addProperty("lastSeen", lastModified);
+									stats.add(uuid, playerData);
 								} catch (IOException e) {
 									LOGGER.error("Failed to read stat file: " + e.getMessage());
 								}
