@@ -16,7 +16,8 @@
 	"environment": "server",
 	"entrypoints": {
 		"main": [
-			"l3gh.stats.mod.Statmod"
+			"l3gh.stats.mod.Statmod",
+			"l3gh.inv.mod.InvMod"
 		]
 	},
 	"depends": {
@@ -24,5 +25,9 @@
 		"minecraft": "~1.20.1",
 		"java": ">=17",
 		"fabric-api": "*"
-	}
+	},
+	"mixins": [
+		"stat-mod.mixins.json",
+		"inv-mod.mixins.json"
+	]
 }
