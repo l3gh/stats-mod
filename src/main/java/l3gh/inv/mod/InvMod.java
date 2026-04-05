@@ -4,15 +4,21 @@ import com.google.gson.JsonObject;
 import com.google.gson.JsonParser;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
+import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
 import net.fabricmc.loader.api.FabricLoader;
-import io.netty.channel.Channel;
-import io.netty.handler.codec.http.websocketx.TextWebSocketFrame;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.NbtIo;
 import net.minecraft.server.MinecraftServer;
 import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.world.level.storage.LevelResource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.Map;
@@ -24,11 +30,11 @@ public class InvMod implements ModInitializer {
     public static final Logger LOGGER = LoggerFactory.getLogger(MOD_ID);
 
     private static MinecraftServer server;
-    private static WsServer wsServer;
+    private static String secret;
+    private static String endpoint;
+    private static final HttpClient httpClient = HttpClient.newHttpClient();
 
-    // Debounce: markDirty() fires on every slot change, so we wait 300ms of
-    // silence before actually serialising + broadcasting. This batches rapid
-    // inventory operations (e.g. shift-clicking a stack) into one push.
+    // debounce rapid slot changes — 300ms quiet before posting
     private static final ScheduledExecutorService debouncer =
             Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "inv-mod-debouncer");
@@ -43,75 +49,103 @@ public class InvMod implements ModInitializer {
             server = s;
 
             Path configFile = FabricLoader.getInstance().getConfigDir().resolve("inv-mod.json");
-            String secret;
-            int port;
-
             try {
                 String content = Files.readString(configFile);
                 JsonObject config = JsonParser.parseString(content).getAsJsonObject();
-                secret = config.get("secret").getAsString();
-                port   = config.get("port").getAsInt();
+                secret   = config.get("secret").getAsString();
+                endpoint = config.get("endpoint").getAsString();
             } catch (IOException e) {
                 LOGGER.error("inv-mod: config missing — create config/inv-mod.json:");
-                LOGGER.error("  {\"secret\": \"your-token-here\", \"port\": 15059}");
+                LOGGER.error("  {\"secret\": \"your-token\", \"endpoint\": \"https://l3gh.com/api/ingest-inv\"}");
                 return;
             }
 
-            wsServer = new WsServer(secret, port);
-            try {
-                wsServer.start();
-            } catch (Exception e) {
-                LOGGER.error("inv-mod: failed to start WebSocket server on port " + port + ": " + e.getMessage());
-                LOGGER.error("inv-mod: port may be blocked — check your host panel or try a different port");
-            }
+            // push every player's last known inventory from disk on startup
+            pushAllOfflinePlayerData(s);
+        });
+
+        // when a player logs out, push their final live inventory
+        ServerPlayConnectionEvents.DISCONNECT.register((handler, s) -> {
+            ServerPlayer player = handler.getPlayer();
+            JsonObject payload = InvSerializer.serialize(player);
+            postAsync(payload);
         });
 
         ServerLifecycleEvents.SERVER_STOPPING.register(s -> {
-            if (wsServer != null) wsServer.stop();
             debouncer.shutdownNow();
         });
     }
 
-    /**
-     * Called by WsFrameHandler after a client authenticates.
-     * Immediately sends the current inventory state of every online player
-     * so the frontend doesn't show an empty grid until someone moves an item.
-     */
-    public static void pushAllOnlinePlayers(Channel ch) {
-        if (server == null || !ch.isActive()) return;
-        server.execute(() -> {
-            for (ServerPlayer p : server.getPlayerList().getPlayers()) {
-                String json = InvSerializer.serialize(p).toString();
-                ch.writeAndFlush(new TextWebSocketFrame(json));
+    private static void pushAllOfflinePlayerData(MinecraftServer s) {
+        Path playerDataDir = s.getWorldPath(LevelResource.ROOT).resolve("playerdata");
+        if (!Files.exists(playerDataDir)) {
+            LOGGER.warn("inv-mod: playerdata directory not found at {}", playerDataDir);
+            return;
+        }
+
+        debouncer.submit(() -> {
+            try {
+                Files.list(playerDataDir)
+                    .filter(p -> p.toString().endsWith(".dat"))
+                    .forEach(datFile -> {
+                        String filename = datFile.getFileName().toString();
+                        String uuidStr  = filename.replace(".dat", "");
+                        try { UUID.fromString(uuidStr); } catch (IllegalArgumentException e) { return; }
+
+                        try {
+                            CompoundTag nbt = NbtIo.readCompressed(datFile.toFile());
+                            JsonObject payload = InvSerializer.serializeFromDat(uuidStr, nbt);
+                            postAsync(payload);
+                        } catch (IOException e) {
+                            LOGGER.error("inv-mod: failed to read playerdata for {}: {}", uuidStr, e.getMessage());
+                        }
+                    });
+                LOGGER.info("inv-mod: finished pushing offline player inventory data");
+            } catch (IOException e) {
+                LOGGER.error("inv-mod: failed to list playerdata directory: {}", e.getMessage());
             }
         });
     }
 
-    /**
-     * Called from PlayerInventoryMixin whenever a player's inventory is marked dirty.
-     * Debounces rapid successive calls and schedules a serialise+broadcast after 300ms of quiet.
-     */
     public static void onInventoryChanged(ServerPlayer player) {
-        if (wsServer == null) return;
+        if (endpoint == null) return;
 
         UUID uuid = player.getUUID();
-
-        // cancel any pending push for this player and reschedule
         ScheduledFuture<?> existing = pending.remove(uuid);
         if (existing != null) existing.cancel(false);
 
         pending.put(uuid, debouncer.schedule(() -> {
             pending.remove(uuid);
-            if (server == null || wsServer == null) return;
-
-            // jump back to the server thread to safely read inventory state
+            if (server == null) return;
             server.execute(() -> {
                 ServerPlayer p = server.getPlayerList().getPlayer(uuid);
-                if (p == null) return; // player logged off in the 300ms window
-                String json = InvSerializer.serialize(p).toString();
-                wsServer.broadcast(json);
+                if (p == null) return;
+                JsonObject payload = InvSerializer.serialize(p);
+                postAsync(payload);
                 LOGGER.debug("inv-mod: pushed inventory for {}", p.getName().getString());
             });
         }, 300, TimeUnit.MILLISECONDS));
+    }
+
+    public static void postAsync(JsonObject payload) {
+        if (endpoint == null || secret == null) return;
+        payload.addProperty("secret", secret);
+
+        HttpRequest request = HttpRequest.newBuilder()
+                .uri(URI.create(endpoint))
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(payload.toString()))
+                .build();
+
+        httpClient.sendAsync(request, HttpResponse.BodyHandlers.ofString())
+                .thenAccept(res -> {
+                    if (res.statusCode() != 200) {
+                        LOGGER.warn("inv-mod: ingest returned {}", res.statusCode());
+                    }
+                })
+                .exceptionally(e -> {
+                    LOGGER.error("inv-mod: failed to post inventory: {}", e.getMessage());
+                    return null;
+                });
     }
 }
